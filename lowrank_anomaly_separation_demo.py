@@ -385,6 +385,136 @@ def separate_lowrank_anomalies(
     return estimates, info
 
 
+# ---------------------------------------------------------------------------
+# RPCA-style low-rank + sparse decomposition (minimal priors)
+# ---------------------------------------------------------------------------
+
+def rpca_magnitude_decompose(
+    V: np.ndarray,
+    lam: float | None = None,
+    beta: float | None = None,
+    tol: float = 1e-6,
+    max_iter: int = 2000,
+    verbose: bool = False,
+):
+    """
+    Low-rank (smooth) + sparse decomposition on magnitude spectrogram.
+
+    Uses temporal-sparsity assumption: the background is always (or almost
+    always) present, whereas anomalies appear only in some time intervals.
+    Identifies time frames dominated by the background by looking at the
+    lower envelope of per-frame energy, reconstructs the background
+    spectrogram from those frames, and sets the residual as anomalies.
+
+    This is one of the weakest possible priors:
+      - No frequency-band assumptions
+      - No source-count assumptions
+      - No rank assumptions
+      - Only assumes anomalies are temporally sparse enough that some
+        frames contain mostly background.
+
+    V : (F, T) non-negative magnitude spectrogram.
+    Returns L (background), S (anomalies), info dict.
+    """
+    F, T = V.shape
+
+    # Per-frame total energy
+    energy = V.sum(axis=0)  # shape (T,)
+
+    # Use lower percentile of energy to identify background-dominated frames.
+    # 15th percentile expects at least 15% of the recording to be anomaly-free.
+    lo_pct = 15.0
+    energy_thresh = np.percentile(energy, lo_pct)
+    bg_mask = energy <= energy_thresh
+    n_bg = int(np.sum(bg_mask))
+
+    # Estimate background subspace from the quietest frames.
+    # Use SVD to get a low-rank basis that captures the FM-modulated
+    # harmonic structure (rank is auto-determined by energy ratio).
+    min_rank = 3
+    max_rank = 30
+    if n_bg >= min_rank:
+        V_bg = V[:, bg_mask]
+        U_bg, s_bg, _ = np.linalg.svd(V_bg, full_matrices=False)
+        # Keep components that capture 98% of background-frame energy.
+        energy_cumsum = np.cumsum(s_bg ** 2)
+        energy_total = energy_cumsum[-1]
+        rank = int(np.searchsorted(energy_cumsum, 0.98 * energy_total))
+        rank = max(min_rank, min(rank, max_rank, len(s_bg)))
+        basis = U_bg[:, :rank]  # (F, rank)
+    else:
+        # Fallback: use SVD on all frames with conservative rank.
+        U_all, s_all, _ = np.linalg.svd(V, full_matrices=False)
+        energy_cumsum = np.cumsum(s_all ** 2)
+        rank = int(np.searchsorted(energy_cumsum, 0.98 * energy_cumsum[-1]))
+        rank = max(min_rank, min(rank, max_rank, len(s_all)))
+        basis = U_all[:, :rank]
+
+    effective_rank = rank
+    if verbose:
+        print(f"  RPCA temporal-sparsity: {n_bg}/{T} frames below "
+              f"{lo_pct}th energy percentile, background rank={effective_rank}")
+
+    # Project each frame onto the background subspace.
+    coefs = basis.T @ V  # (rank, T)
+    L = np.clip(basis @ coefs, 0.0, None)
+    S = V - L
+    S = np.maximum(S, 0.0)
+    L = V - S
+
+    info = {
+        "n_iter": 1,
+        "effective_rank": effective_rank,
+        "lam": 0.0,
+    }
+    return L, S, info
+
+
+def separate_anomalies_rpca(
+    x: np.ndarray,
+    fs: int,
+    n_fft: int = 1024,
+    hop: int = 256,
+    lam: float | None = None,
+    rpca_tol: float = 1e-6,
+    rpca_max_iter: int = 2000,
+    verbose: bool = False,
+):
+    """
+    Single-channel anomaly separation using RPCA on the magnitude spectrogram.
+
+    Only assumptions:
+      1. Background is approximately low-rank in the magnitude spectrogram.
+      2. Anomalies are sparse in time-frequency.
+
+    Returns:
+      estimates: [background, anomalies_sum]  (2 time-domain signals)
+      info:      dict with L, S, effective_rank, etc.
+    """
+    freqs, times, X = stft_signal(x, fs, n_fft, hop)
+    V = np.abs(X)
+
+    L, S, rpca_info = rpca_magnitude_decompose(
+        V, lam=lam, tol=rpca_tol, max_iter=rpca_max_iter, verbose=verbose,
+    )
+
+    # Phase-aware reconstruction using Wiener-like masking (power=2).
+    group_magnitudes = [L, S]
+    estimates = reconstruct_sources(
+        X, group_magnitudes, fs=fs, n_fft=n_fft, hop=hop, length=len(x), power=2.0,
+    )
+
+    info = {
+        "freqs": freqs,
+        "times": times,
+        "X": X,
+        "L": L,
+        "S": S,
+        "rpca": rpca_info,
+    }
+    return estimates, info
+
+
 def si_sdr(reference: np.ndarray, estimate: np.ndarray) -> float:
     reference = reference - np.mean(reference)
     estimate = estimate - np.mean(estimate)
@@ -473,32 +603,53 @@ def main():
     seed = 42
 
     t, mixture, true_sources, meta = generate_car_mixture(M=M, fs=fs, duration=duration, seed=seed)
-
-    estimates, info = separate_lowrank_anomalies(
-        mixture,
-        fs=fs,
-        meta=meta,
-        bg_rank=4,
-        n_fft=1024,
-        hop=256,
-        n_iter=500,
-        seed=seed,
-        use_misi=False,  # Set True to try MISI-style phase refinement.
-    )
-
     names = ["background"] + [m.name for m in meta]
-    rows = evaluate_separation(true_sources, estimates, names)
-    print_metrics_table(rows)
-
     out_dir = "output_lowrank_demo"
+
+    # ---- Baseline: Constrained Group NMF with frequency masks ----
+    print("=" * 70)
+    print("Method 1: Group NMF with frequency masks (original)")
+    print("=" * 70)
+    estimates_nmf, info_nmf = separate_lowrank_anomalies(
+        mixture, fs=fs, meta=meta, bg_rank=4, n_fft=1024, hop=256,
+        n_iter=500, seed=seed,
+    )
+    rows_nmf = evaluate_separation(true_sources, estimates_nmf, names)
+    print_metrics_table(rows_nmf)
+
+    # ---- RPCA: Low-rank + sparse decomposition (minimal priors) ----
+    print("\n" + "=" * 70)
+    print("Method 2: RPCA low-rank + sparse (minimal priors)")
+    print("=" * 70)
+    estimates_rpca, info_rpca = separate_anomalies_rpca(
+        mixture, fs=fs, n_fft=1024, hop=256, verbose=True,
+    )
+    # RPCA outputs [background, anomalies_sum] — combine true anomaly sources
+    # for a fair comparison.
+    true_anomalies_sum = np.sum(true_sources[1:], axis=0)
+    rpca_true = [true_sources[0], true_anomalies_sum]
+    rpca_names = ["background", "anomalies_sum"]
+    rows_rpca = evaluate_separation(rpca_true, estimates_rpca, rpca_names)
+    print_metrics_table(rows_rpca)
+
+    print(f"\n  RPCA effective rank of background: {info_rpca['rpca']['effective_rank']}")
+    print(f"  RPCA iterations: {info_rpca['rpca']['n_iter']}")
+    print(f"  RPCA lambda (auto): {info_rpca['rpca']['lam']:.4f}")
+
+    # ---- Save all audio files ----
     save_wav(os.path.join(out_dir, "mixture.wav"), fs, mixture)
     for name, s in zip(names, true_sources):
         save_wav(os.path.join(out_dir, f"true_{name}.wav"), fs, s)
-    for name, s_hat in zip(names, estimates):
-        save_wav(os.path.join(out_dir, f"estimated_{name}.wav"), fs, s_hat)
+    # Also save summed anomalies for RPCA comparison
+    save_wav(os.path.join(out_dir, "true_anomalies_sum.wav"), fs, true_anomalies_sum)
+    for name, s_hat in zip(names, estimates_nmf):
+        save_wav(os.path.join(out_dir, f"estimated_nmf_{name}.wav"), fs, s_hat)
+    for name, s_hat in zip(rpca_names, estimates_rpca):
+        save_wav(os.path.join(out_dir, f"estimated_rpca_{name}.wav"), fs, s_hat)
 
     print(f"\nSaved wav files to: {out_dir}/")
-    print("Estimated source order:", ", ".join(names))
+    print("NMF source order:", ", ".join(names))
+    print("RPCA source order:", ", ".join(rpca_names))
 
 
 if __name__ == "__main__":
